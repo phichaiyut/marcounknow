@@ -71,6 +71,8 @@ FOCUS_DELAY = 0.12              # รอหลังสลับกลับไ�
 KEY_GAP = 0.02                  # เว้นระหว่างปุ่ม
 PASTE_SETTLE = 0.06             # รอหลัง Ctrl+V ก่อนกด Enter
 CLIPBOARD_RESTORE_DELAY = 0.30  # รอก่อนคืนค่า Clipboard
+FOCUS_RETRIES = 3               # สลับกลับ IDE ไม่ติด -> ลองใหม่กี่รอบก่อนแจ้งเตือน
+HOVER_DEBOUNCE_MS = 30          # หน่วงพรีวิวตอนชี้ปุ่ม (ms) กัน UI รีเฟรชรัวตอนลากเมาส์ผ่านหลายปุ่ม
 
 # ---- หน้าต่าง ----
 WINDOW_ALPHA = 1.0        # 0.85 - 1.0 (โปร่งใส)
@@ -880,10 +882,9 @@ class Typer(threading.Thread):
             if not target or not user32.IsWindow(target):
                 self.status('ยังไม่รู้ว่าจะพิมพ์ลงหน้าต่างไหน — คลิกที่ IDE ก่อน 1 ครั้ง', ok=False)
                 return
-            if not focus_window(target):
+            if not self._ensure_focus(target):
                 self.status('สลับไปหน้าต่าง IDE ไม่ได้ — คลิกที่ IDE แล้วใช้คีย์ลัดแทน', ok=False)
                 return
-            time.sleep(FOCUS_DELAY)
 
         if opts['end']:
             tap(VK_END)
@@ -909,6 +910,18 @@ class Typer(threading.Thread):
         if opts['enter']:
             tap(VK_RETURN)
         self.status(f'✓ {text}')
+
+    @staticmethod
+    def _ensure_focus(target):
+        """สลับกลับไป IDE แล้วยืนยันว่าเป็น Foreground จริง 'หลัง' รอ FOCUS_DELAY ก่อนส่งคีย์
+        (เดิมเช็กครั้งเดียวก่อนรอ — ถ้าหน้าต่าง Macro แย่ง Focus คืนระหว่างรอ คีย์จะไปผิดที่/ตกหล่น)"""
+        for _ in range(FOCUS_RETRIES):
+            if focus_window(target):
+                time.sleep(FOCUS_DELAY)
+                if user32.GetForegroundWindow() == target:
+                    return True
+            time.sleep(0.05)
+        return False
 
     def _restore_clip(self, gen, ours):
         with self._clip_lock:
@@ -1010,6 +1023,7 @@ def build_app(start_hotkeys=True):
             self.v_preview = tk.StringVar(value='')
             self.v_target = tk.StringVar(value='เป้าหมาย: -')
             self.v_actinfo = tk.StringVar(value='')
+            self._hover_job = None   # after-id ของ hover preview ที่รออยู่ (debounce)
 
             self._build_ui()
             self.v_act.trace_add('write', lambda *a: self._on_act_change())
@@ -1053,7 +1067,9 @@ def build_app(start_hotkeys=True):
                       activebackground='#115e59', activeforeground='white', relief='flat', bd=0,
                       font=('Segoe UI', 9, 'bold'), padx=8, cursor='hand2', takefocus=0,
                       command=lambda: self.run_cmd('cmd:ctrl+alt+o', from_button=True)).pack(side='left', padx=(6, 0))
-            ttk.Label(top, textvariable=self.v_target, foreground='#555').pack(side='left', padx=6)
+            # width=1 + expand: ชื่อหน้าต่างเป้าหมายยาว/สั้น ไม่ดันความกว้างหน้าต่าง (ปุ่มไม่ไหลตาม)
+            ttk.Label(top, textvariable=self.v_target, foreground='#555', width=1).pack(
+                side='left', padx=6, fill='x', expand=True)
             ttk.Checkbutton(top, text='ย่อ', variable=self.v_compact, command=self._toggle_compact,
                             takefocus=0).pack(side='right')
             ttk.Checkbutton(top, text='บนสุด', variable=self.v_top, takefocus=0,
@@ -1113,11 +1129,17 @@ def build_app(start_hotkeys=True):
             self._build_action_pad(outer)
 
             # ---- พรีวิว + สถานะ ----
-            self.lbl_preview = ttk.Label(outer, textvariable=self.v_preview, style='Preview.TLabel',
-                                         foreground='#6b46c1', wraplength=470, justify='left')
+            # ขนาดคงที่ 100% (Zero Layout Shift): ใช้ tk.Label กำหนด height เป็นจำนวนบรรทัด + width=1
+            # -> ความสูง/ความกว้างที่ขอจากหน้าต่างไม่ขึ้นกับข้อความเลย ข้อความยาวจะถูกตัดขวา/ตัดบรรทัดภายในกรอบ
+            # (เดิมพรีวิวใช้ wraplength: ตอนชี้ปุ่ม 1 บรรทัด / ตอนออก 2 บรรทัด -> แท็บด้านล่างเด้งขึ้นลง
+            #  หนีเมาส์ เกิด <Leave>/<Enter> วนไม่จบ ภาพซ้อน และคลิกไม่ติด)
+            bg = style.lookup('TFrame', 'background') or root.cget('bg')
+            self.lbl_preview = tk.Label(outer, textvariable=self.v_preview, font=CODE_FONT, fg='#6b46c1', bg=bg,
+                                        anchor='w', justify='left', height=1, width=1, padx=0, pady=0)
             self.lbl_preview.pack(fill='x')
-            self.lbl_status = ttk.Label(outer, textvariable=self.v_status, style='Status.TLabel',
-                                        foreground='#1f7a3a', wraplength=380, justify='left')
+            # สถานะ 1 บรรทัดคงที่ (สูงเท่าเดิม) — ข้อความ ✓/เตือน ที่เด้งมาตอนเมาส์อยู่บนปุ่มจะไม่ดันแท็บลง
+            self.lbl_status = tk.Label(outer, textvariable=self.v_status, font=('Segoe UI', 10), fg='#1f7a3a',
+                                       bg=bg, anchor='w', justify='left', height=1, width=1, padx=0, pady=0)
             self.lbl_status.pack(fill='x', pady=(0, 4))
 
             # ---- แท็บปุ่มคำสั่ง (เป็นโพยคีย์ลัดไปในตัว) ----
@@ -1137,6 +1159,7 @@ def build_app(start_hotkeys=True):
                                   'กดปุ่มบนจอ = พิมพ์ลง IDE ล่าสุด', foreground='#777').pack(fill='x', pady=(4, 0))
             self.compact_parts = [self.nb]
 
+            self._lock_actdesc_size()
             sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
             root.update_idletasks()
             if root.winfo_reqheight() > sh - 80:     # จอเตี้ย (1366x768 / สเกล 150%) -> เริ่มแบบย่อ
@@ -1157,8 +1180,9 @@ def build_app(start_hotkeys=True):
                     b = ttk.Button(frame, style='Code.TButton', takefocus=0, width=-10,
                                    command=lambda cid=c.id: self.run_cmd(cid, from_button=True))
                     b.grid(row=row, column=col, padx=1, pady=1, sticky='ew')
-                    b.bind('<Enter>', lambda e, cid=c.id: self._show_preview(cid))
-                    b.bind('<Leave>', lambda e: self._live_preview())
+                    # bind แบบ add='+' และไม่คืน 'break' -> ไม่แตะ class binding ของปุ่ม (คลิกทำงานปกติ 100%)
+                    b.bind('<Enter>', lambda e, cid=c.id: self._schedule_preview(cid), add='+')
+                    b.bind('<Leave>', lambda e: self._schedule_preview(None), add='+')
                     self.cmd_buttons.append((b, c))
                     col += 1
                     if col == cols:
@@ -1212,9 +1236,16 @@ def build_app(start_hotkeys=True):
                 grid.columnconfigure(c, weight=1, uniform='tile')
 
             # คำอธิบายเต็มของตัวที่เลือก (ff/bb เทียบ Gyro)
-            self.lbl_actdesc = tk.Label(box, textvariable=self.v_actinfo, font=('Segoe UI', 9), anchor='w',
+            # กล่องขนาดคงที่: วัดขนาดสูงสุดของคำอธิบายทุกตัวอักษร (รวม None) ที่ DPI ปัจจุบัน แล้วล็อกไว้
+            # -> เปลี่ยน Action แล้วแท็บ/ปุ่มด้านล่างไม่ขยับ (เดิมเด้ง 40px เมื่อเลือก n / f)
+            # (ขนาดจริงล็อกใน _lock_actdesc_size หลังวางทุกอย่างเสร็จ)
+            self._act_grid = grid
+            holder = self._actdesc_holder = tk.Frame(box, height=1)
+            self.lbl_actdesc = tk.Label(holder, textvariable=self.v_actinfo, font=('Segoe UI', 9), anchor='nw',
                                         justify='left', wraplength=460, padx=6, pady=3)
-            self.lbl_actdesc.pack(fill='x', pady=(4, 0))
+            holder.pack_propagate(False)
+            holder.pack(fill='x', pady=(4, 0))
+            self.lbl_actdesc.pack(fill='both', expand=True)
 
         def _make_tile(self, parent, ch):
             light, strong = ACTION_COLOR[ch]
@@ -1257,18 +1288,39 @@ def build_app(start_hotkeys=True):
                 else:
                     w.pack(fill='both', expand=True, after=self.lbl_status)
 
+        @staticmethod
+        def _actinfo_text(ch):
+            if ch == ACT_NONE:
+                return ('None — ไม่ใส่ select: ใช้กับคำสั่งที่ select เป็น optional เช่น FFcm / FFtimer / FFcmG / ffdircl\n'
+                        'คำสั่งที่บังคับมี select (FFC, FFL, FFBG ...) จะไม่พิมพ์ และขึ้นเตือน · ชุด ffdirclg/ffdirg ใช้ \'p\' แทน')
+            line, gyro = ACTION_INFO[ch]
+            return (f"'{ch}'  ตามเส้น (FFC / BBC ...):  {line}\n"
+                    f"'{ch}'  Gyro (FFcmG / FFBG ...):  {gyro}")
+
         def _update_actinfo(self):
             ch = self.v_act.get()
             light, strong = ACTION_COLOR.get(ch, ACTION_NONE_COLORS)
-            if ch == ACT_NONE:
-                text = ('None — ไม่ใส่ select: ใช้กับคำสั่งที่ select เป็น optional เช่น FFcm / FFtimer / FFcmG / ffdircl\n'
-                        'คำสั่งที่บังคับมี select (FFC, FFL, FFBG ...) จะไม่พิมพ์ และขึ้นเตือน · ชุด ffdirclg/ffdirg ใช้ \'p\' แทน')
-            else:
-                line, gyro = ACTION_INFO[ch]
-                text = (f"'{ch}'  ตามเส้น (FFC / BBC ...):  {line}\n"
-                        f"'{ch}'  Gyro (FFcmG / FFBG ...):  {gyro}")
-            self.v_actinfo.set(text)
+            text = self._actinfo_text(ch) if (ch == ACT_NONE or ch in ACTION_INFO) else ''
+            if self.v_actinfo.get() != text:
+                self.v_actinfo.set(text)
             self.lbl_actdesc.configure(bg=light, fg=strong)
+
+        def _lock_actdesc_size(self):
+            """ตัดบรรทัดตามความกว้างจริงของแผงปุ่ม Action แล้วล็อกความสูงกล่อง = คำอธิบายที่ยาวที่สุด (ทุกตัว + None)"""
+            self.root.update_idletasks()
+            box = self._act_grid.master
+            outer = box.master
+            # ความกว้างที่ได้แน่ทั้งโหมดเต็ม/โหมดย่อ = แผงที่กว้างสุดใน outer (ไม่นับแท็บ ซึ่งถูกซ่อนตอนย่อ)
+            inner = max(w.winfo_reqwidth() for w in outer.pack_slaves() if w is not self.nb)
+            insets = box.winfo_reqwidth() - self._act_grid.winfo_reqwidth()   # ขอบ + padding ของ LabelFrame
+            wrap = max(inner - insets - 2 * int(self.lbl_actdesc.cget('padx')) - 4, 300)
+            self.lbl_actdesc.configure(wraplength=wrap)
+            max_h = 0
+            for ch in [ACT_NONE] + ACTION_LIST:
+                self.v_actinfo.set(self._actinfo_text(ch))
+                self.lbl_actdesc.update_idletasks()
+                max_h = max(max_h, self.lbl_actdesc.winfo_reqheight())
+            self._actdesc_holder.configure(height=max_h)
 
         def _on_act_change(self):
             self._refresh_action_pad()
@@ -1279,7 +1331,7 @@ def build_app(start_hotkeys=True):
             """บรรทัดตัวอย่างสด: FFC (เส้น) + ffdircl (ลำดับ select/dir) + คำสั่งล่าสุด"""
             p, errors = self.read_params()
             if errors:
-                self.v_preview.set('⚠ ' + ', '.join(errors))
+                self._set_preview('⚠ ' + ', '.join(errors))
                 return
             ids = ['cmd:ctrl+alt+1', 'cmd:ctrl+alt+;']    # FFC (เส้น) + ffdircl (ลำดับ select/dir)
             if self.last_cmd_id and self.last_cmd_id not in ids:
@@ -1290,7 +1342,27 @@ def build_app(start_hotkeys=True):
                     parts.append(render(self.cmds[cid], p, self.opts()))
                 except ValueError:
                     parts.append(f'{self.cmds[cid].label(self.v_alias.get())}(✗ ค่าไม่ครบ/นอกช่วง)')
-            self.v_preview.set('ตัวอย่าง →  ' + '   '.join(parts))
+            self._set_preview('ตัวอย่าง →  ' + '   '.join(parts))
+
+        def _set_preview(self, text):
+            if self.v_preview.get() != text:   # ข้อความเดิมเป๊ะ -> ไม่สั่งวาดซ้ำ
+                self.v_preview.set(text)
+
+        def _schedule_preview(self, cid):
+            """Hover debounce: ลากเมาส์ผ่านหลายปุ่มเร็ว ๆ จะอัปเดตครั้งเดียวตอนหยุด (cid=None = กลับเป็นตัวอย่างสด)"""
+            if self._hover_job is not None:
+                try:
+                    self.root.after_cancel(self._hover_job)
+                except Exception:
+                    pass
+            self._hover_job = self.root.after(HOVER_DEBOUNCE_MS, self._apply_hover, cid)
+
+        def _apply_hover(self, cid):
+            self._hover_job = None
+            if cid is None:
+                self._live_preview()
+            else:
+                self._show_preview(cid)
 
         # ------------------------------------------------------ ค่า/ตรวจสอบ
         def read_params(self):
@@ -1329,12 +1401,12 @@ def build_app(start_hotkeys=True):
         def _show_preview(self, cid):
             p, errors = self.read_params()
             if errors:
-                self.v_preview.set('⚠ ' + ', '.join(errors))
+                self._set_preview('⚠ ' + ', '.join(errors))
                 return
             try:
-                self.v_preview.set('→ ' + render(self.cmds[cid], p, self.opts()))
+                self._set_preview('→ ' + render(self.cmds[cid], p, self.opts()))
             except ValueError as exc:
-                self.v_preview.set('⚠ ' + str(exc))
+                self._set_preview('⚠ ' + str(exc))
 
         def set_status(self, msg, ok=True):
             self.v_status.set(msg)
